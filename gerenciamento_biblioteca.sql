@@ -1,283 +1,248 @@
 -- =================================================================
--- Script de Criação do Banco de Dados: Sistema de Biblioteca
--- Foco: Integridade de Dados, Performance e Robustez.
--- Dialeto: MySQL / MariaDB
+-- PROJETO: Sistema de Gestão de Biblioteca (High Performance)
+-- AUTOR: Ricardo Fiorini Cuato
+-- DATA: 2025
+-- DIALETO: MySQL 8.0 / MariaDB 10.5+
 -- =================================================================
 
--- Remove objetos antigos se existirem para tornar o script idempotente
-DROP VIEW IF EXISTS ActiveLoans;
-DROP VIEW IF EXISTS BooksWithAuthors;
-DROP FUNCTION IF EXISTS CalculateLateDays;
-DROP TRIGGER IF EXISTS trg_AfterLoanUpdate;
-DROP TRIGGER IF EXISTS trg_AfterLoanInsert;
-DROP TRIGGER IF EXISTS trg_BeforeLoanInsert;
+SET NAMES utf8mb4;
+SET TIME_ZONE = '-03:00';
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- =================================================================
+-- 1. LIMPEZA DE AMBIENTE (Idempotência)
+-- =================================================================
+DROP VIEW IF EXISTS vw_ActiveLoans;
+DROP VIEW IF EXISTS vw_BookDetails;
+DROP PROCEDURE IF EXISTS sp_RegisterLoan;
+DROP PROCEDURE IF EXISTS sp_ProcessReturn;
+DROP TRIGGER IF EXISTS trg_Books_UpdateTimestamp;
+DROP TRIGGER IF EXISTS trg_Members_UpdateTimestamp;
 DROP TABLE IF EXISTS Loans;
-DROP TABLE IF EXISTS Members;
 DROP TABLE IF EXISTS Books;
+DROP TABLE IF EXISTS Members;
 DROP TABLE IF EXISTS Authors;
 
 -- =================================================================
--- 1. CRIAÇÃO DAS TABELAS
+-- 2. ESTRUTURA DE TABELAS
 -- =================================================================
 
--- Tabela de Autores
+-- Tabela: Autores
 CREATE TABLE Authors (
-    AuthorID INT PRIMARY KEY AUTO_INCREMENT,
+    AuthorID INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     Name VARCHAR(255) NOT NULL,
     BirthDate DATE,
-    Nationality VARCHAR(100)
+    Nationality VARCHAR(100),
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_author_name (Name) -- Índice para busca rápida por nome
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Tabela de Livros
-CREATE TABLE Books (
-    BookID INT PRIMARY KEY AUTO_INCREMENT,
-    Title VARCHAR(255) NOT NULL,
-    AuthorID INT NOT NULL, -- Um livro deve ter um autor
-    Genre VARCHAR(100),
-    PublicationYear YEAR(4), -- Mais eficiente que INT para anos
-    IsAvailable BOOLEAN DEFAULT TRUE NOT NULL,
-    
-    FOREIGN KEY (AuthorID) REFERENCES Authors(AuthorID)
-        ON DELETE RESTRICT -- Impede excluir um autor que tenha livros
-        ON UPDATE CASCADE,
-        
-    CHECK (PublicationYear IS NULL OR (PublicationYear > 1000 AND PublicationYear <= YEAR(CURRENT_DATE)))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Tabela de Membros
+-- Tabela: Membros
 CREATE TABLE Members (
-    MemberID INT PRIMARY KEY AUTO_INCREMENT,
+    MemberID INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     Name VARCHAR(255) NOT NULL,
-    Email VARCHAR(255) UNIQUE NOT NULL,
+    Email VARCHAR(255) NOT NULL,
     Phone VARCHAR(20),
-    JoinDate DATE DEFAULT CURRENT_DATE NOT NULL
+    Status ENUM('Active', 'Suspended', 'Inactive') DEFAULT 'Active',
+    JoinDate DATE DEFAULT (CURRENT_DATE),
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    CONSTRAINT uq_member_email UNIQUE (Email),
+    INDEX idx_member_status (Status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Tabela de Empréstimos
+-- Tabela: Livros
+CREATE TABLE Books (
+    BookID INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    Title VARCHAR(255) NOT NULL,
+    AuthorID INT UNSIGNED NOT NULL,
+    Genre VARCHAR(100),
+    PublicationYear YEAR,
+    IsAvailable BOOLEAN DEFAULT TRUE NOT NULL,
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_book_author FOREIGN KEY (AuthorID) 
+        REFERENCES Authors(AuthorID) ON DELETE RESTRICT ON UPDATE CASCADE,
+    
+    -- Constraint de integridade lógica
+    CONSTRAINT chk_pub_year CHECK (PublicationYear <= YEAR(CURRENT_DATE)),
+
+    -- Índices
+    INDEX idx_book_genre (Genre),
+    FULLTEXT idx_book_title_ft (Title) -- Performance superior para buscas textuais (ex: "Harry Potter")
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Tabela: Empréstimos
 CREATE TABLE Loans (
-    LoanID INT PRIMARY KEY AUTO_INCREMENT,
-    BookID INT NOT NULL,
-    MemberID INT NOT NULL,
-    LoanDate DATE DEFAULT CURRENT_DATE NOT NULL,
-    DueDate DATE NOT NULL, -- Um empréstimo deve ter data de devolução
-    ReturnDate DATE, -- Permite NULL até ser devolvido
+    LoanID INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    BookID INT UNSIGNED NOT NULL,
+    MemberID INT UNSIGNED NOT NULL,
+    LoanDate DATE DEFAULT (CURRENT_DATE) NOT NULL,
+    DueDate DATE NOT NULL,
+    ReturnDate DATE NULL,
     
-    FOREIGN KEY (BookID) REFERENCES Books(BookID)
-        ON DELETE RESTRICT -- Impede excluir um livro com histórico de empréstimo
-        ON UPDATE CASCADE,
-        
-    FOREIGN KEY (MemberID) REFERENCES Members(MemberID)
-        ON DELETE RESTRICT -- Impede excluir um membro com histórico de empréstimo
-        ON UPDATE CASCADE,
-        
-    CHECK (DueDate >= LoanDate),
-    CHECK (ReturnDate IS NULL OR ReturnDate >= LoanDate)
+    -- Coluna Gerada (Virtual): Calcula dias de atraso nativamente sem custo de função escalar
+    DaysOverdue INT GENERATED ALWAYS AS (
+        CASE 
+            WHEN ReturnDate IS NULL AND CURRENT_DATE > DueDate THEN DATEDIFF(CURRENT_DATE, DueDate)
+            WHEN ReturnDate IS NOT NULL AND ReturnDate > DueDate THEN DATEDIFF(ReturnDate, DueDate)
+            ELSE 0 
+        END
+    ) VIRTUAL,
+
+    Status ENUM('Active', 'Returned', 'Overdue') DEFAULT 'Active',
+    CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_loan_book FOREIGN KEY (BookID) 
+        REFERENCES Books(BookID) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_loan_member FOREIGN KEY (MemberID) 
+        REFERENCES Members(MemberID) ON DELETE RESTRICT ON UPDATE CASCADE,
+
+    CONSTRAINT chk_loan_dates CHECK (DueDate >= LoanDate),
+    CONSTRAINT chk_return_date CHECK (ReturnDate IS NULL OR ReturnDate >= LoanDate),
+
+    -- Índices compostos para performance de dashboard
+    INDEX idx_loan_status_dates (Status, DueDate),
+    INDEX idx_loan_member_history (MemberID, LoanDate)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =================================================================
--- 2. CRIAÇÃO DE ÍNDICES PARA PERFORMANCE
+-- 3. STORED PROCEDURES (Lógica de Negócio ACID)
 -- =================================================================
 
--- Índices para Chaves Estrangeiras (melhora performance de JOINs)
-CREATE INDEX idx_book_author ON Books(AuthorID);
-CREATE INDEX idx_loan_book ON Loans(BookID);
-CREATE INDEX idx_loan_member ON Loans(MemberID);
-
--- Índices para buscas comuns
-CREATE INDEX idx_book_title ON Books(Title);
-CREATE INDEX idx_member_name ON Members(Name);
-CREATE INDEX idx_loan_returndate ON Loans(ReturnDate); -- Essencial para a view ActiveLoans
-
--- =================================================================
--- 3. CRIAÇÃO DE FUNÇÕES
--- =================================================================
-
--- Função para calcular dias de atraso
--- (Corrigido o bug de sombreamento de variável e melhorada a lógica)
 DELIMITER $$
-CREATE FUNCTION CalculateLateDays(p_LoanID INT) 
-RETURNS INT
-DETERMINISTIC
+
+-- Procedure: Registrar Empréstimo de forma segura
+CREATE PROCEDURE sp_RegisterLoan(
+    IN p_BookID INT UNSIGNED,
+    IN p_MemberID INT UNSIGNED,
+    IN p_Days INT
+)
 BEGIN
-    DECLARE v_lateDays INT DEFAULT 0;
-    DECLARE v_dueDate DATE;
-    DECLARE v_returnDate DATE;
+    DECLARE v_IsAvailable BOOLEAN;
+    DECLARE v_MemberStatus VARCHAR(20);
 
-    -- Seleciona as datas relevantes para o empréstimo específico
-    SELECT DueDate, ReturnDate 
-    INTO v_dueDate, v_returnDate
-    FROM Loans 
-    WHERE LoanID = p_LoanID;
+    -- Inicia Transação
+    START TRANSACTION;
 
-    -- Se o livro foi devolvido, calcula atraso baseado na data de devolução
-    IF v_returnDate IS NOT NULL THEN
-        SET v_lateDays = DATEDIFF(v_returnDate, v_dueDate);
-    -- Se não foi devolvido, calcula atraso baseado na data ATUAL
+    -- Verifica disponibilidade e trava a linha para leitura (FOR UPDATE)
+    SELECT IsAvailable INTO v_IsAvailable 
+    FROM Books WHERE BookID = p_BookID FOR UPDATE;
+
+    -- Verifica status do membro
+    SELECT Status INTO v_MemberStatus 
+    FROM Members WHERE MemberID = p_MemberID;
+
+    IF v_IsAvailable = FALSE THEN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Erro: Livro indisponível.';
+    ELSEIF v_MemberStatus != 'Active' THEN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Erro: Membro não está ativo.';
     ELSE
-        SET v_lateDays = DATEDIFF(CURRENT_DATE, v_dueDate);
+        -- Insere Empréstimo
+        INSERT INTO Loans (BookID, MemberID, LoanDate, DueDate, Status)
+        VALUES (p_BookID, p_MemberID, CURRENT_DATE, DATE_ADD(CURRENT_DATE, INTERVAL p_Days DAY), 'Active');
+
+        -- Atualiza Livro
+        UPDATE Books SET IsAvailable = FALSE WHERE BookID = p_BookID;
+
+        COMMIT;
     END IF;
+END$$
+
+-- Procedure: Realizar Devolução
+CREATE PROCEDURE sp_ProcessReturn(
+    IN p_LoanID INT UNSIGNED
+)
+BEGIN
+    DECLARE v_BookID INT UNSIGNED;
+    DECLARE v_DueDate DATE;
     
-    -- Retorna 0 se não houver atraso
-    RETURN IF(v_lateDays < 0, 0, v_lateDays);
-END$$
-DELIMITER ;
+    START TRANSACTION;
 
--- =================================================================
--- 4. CRIAÇÃO DE TRIGGERS (Gatilhos)
--- =================================================================
+    -- Pega dados do empréstimo
+    SELECT BookID, DueDate INTO v_BookID, v_DueDate 
+    FROM Loans WHERE LoanID = p_LoanID FOR UPDATE;
 
-DELIMITER $$
+    IF v_BookID IS NULL THEN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Erro: Empréstimo não encontrado.';
+    ELSE
+        -- Atualiza Empréstimo
+        UPDATE Loans 
+        SET ReturnDate = CURRENT_DATE,
+            Status = IF(CURRENT_DATE > v_DueDate, 'Overdue', 'Returned')
+        WHERE LoanID = p_LoanID;
 
--- Gatilho para *ANTES* de inserir um empréstimo
--- Impede o empréstimo de um livro que não está disponível
-CREATE TRIGGER trg_BeforeLoanInsert
-BEFORE INSERT ON Loans
-FOR EACH ROW
-BEGIN
-    DECLARE v_isAvailable BOOLEAN;
+        -- Libera Livro
+        UPDATE Books SET IsAvailable = TRUE WHERE BookID = v_BookID;
 
-    SELECT IsAvailable 
-    INTO v_isAvailable 
-    FROM Books 
-    WHERE BookID = NEW.BookID;
-
-    IF v_isAvailable = FALSE THEN
-        SIGNAL SQLSTATE '45000' -- "Unmapped user-defined exception"
-        SET MESSAGE_TEXT = 'Não é possível emprestar o livro: já está indisponível.';
-    END IF;
-END$$
-
--- Gatilho para *DEPOIS* de inserir um empréstimo
--- Atualiza a disponibilidade do livro para FALSE
-CREATE TRIGGER trg_AfterLoanInsert
-AFTER INSERT ON Loans
-FOR EACH ROW
-BEGIN
-    UPDATE Books
-    SET IsAvailable = FALSE
-    WHERE BookID = NEW.BookID;
-END$$
-
--- Gatilho para *DEPOIS* de atualizar um empréstimo
--- Atualiza a disponibilidade do livro quando é devolvido (ou a devolução é desfeita)
-CREATE TRIGGER trg_AfterLoanUpdate
-AFTER UPDATE ON Loans
-FOR EACH ROW
-BEGIN
-    -- Caso 1: O livro está sendo devolvido (ReturnDate de NULL para uma data)
-    IF NEW.ReturnDate IS NOT NULL AND OLD.ReturnDate IS NULL THEN
-        UPDATE Books
-        SET IsAvailable = TRUE
-        WHERE BookID = NEW.BookID;
-        
-    -- Caso 2: A devolução foi "desfeita" (ReturnDate de uma data para NULL)
-    ELSEIF NEW.ReturnDate IS NULL AND OLD.ReturnDate IS NOT NULL THEN
-        UPDATE Books
-        SET IsAvailable = FALSE
-        WHERE BookID = NEW.BookID;
+        COMMIT;
     END IF;
 END$$
 
 DELIMITER ;
 
 -- =================================================================
--- 5. CRIAÇÃO DE VIEWS (Visões)
+-- 4. VIEWS OTIMIZADAS
 -- =================================================================
 
--- View para visualizar todos os empréstimos ativos (não devolvidos)
-CREATE VIEW ActiveLoans AS
+-- Relatório de Empréstimos Ativos e Atrasados
+CREATE VIEW vw_ActiveLoans AS
 SELECT 
     l.LoanID,
-    b.Title,
+    b.Title AS BookTitle,
     m.Name AS MemberName,
-    m.Email AS MemberEmail,
+    m.Email,
     l.LoanDate,
-    l.DueDate
-FROM 
-    Loans l
-JOIN 
-    Books b ON l.BookID = b.BookID
-JOIN 
-    Members m ON l.MemberID = m.MemberID
-WHERE 
-    l.ReturnDate IS NULL; -- O índice idx_loan_returndate otimiza isso
+    l.DueDate,
+    l.DaysOverdue, -- Usa a coluna calculada nativa
+    CASE 
+        WHEN l.DaysOverdue > 0 THEN 'ATRASADO'
+        ELSE 'NO PRAZO'
+    END AS Situation
+FROM Loans l
+JOIN Books b ON l.BookID = b.BookID
+JOIN Members m ON l.MemberID = m.MemberID
+WHERE l.ReturnDate IS NULL;
 
--- View para visualizar todos os livros com informações do autor
-CREATE VIEW BooksWithAuthors AS
+-- Detalhes Completos dos Livros
+CREATE VIEW vw_BookDetails AS
 SELECT 
     b.BookID,
     b.Title,
-    a.Name AS AuthorName,
-    a.Nationality AS AuthorNationality,
+    a.Name AS Author,
     b.Genre,
     b.PublicationYear,
-    b.IsAvailable
-FROM 
-    Books b
-JOIN 
-    Authors a ON b.AuthorID = a.AuthorID;
+    CASE WHEN b.IsAvailable THEN 'Disponível' ELSE 'Emprestado' END AS Status
+FROM Books b
+INNER JOIN Authors a ON b.AuthorID = a.AuthorID;
 
 -- =================================================================
--- 6. DADOS DE EXEMPLO (POPULATE)
+-- 5. POPULATE INICIAL (Dados de Teste)
 -- =================================================================
+SET FOREIGN_KEY_CHECKS = 1;
 
--- Inserindo autores
-INSERT INTO Authors (Name, BirthDate, Nationality) VALUES 
-('George Orwell', '1903-06-25', 'British'),
-('Harper Lee', '1926-04-28', 'American'),
-('J.R.R. Tolkien', '1892-01-03', 'British');
+INSERT INTO Authors (Name, Nationality) VALUES 
+('George Orwell', 'British'), 
+('J.K. Rowling', 'British'),
+('Isaac Asimov', 'American');
 
--- Inserindo livros
+INSERT INTO Members (Name, Email, Phone) VALUES 
+('Ricardo Fiorini', 'ricardo@usf.edu.br', '19999999999'),
+('Aluno Exemplo', 'aluno@teste.com', '11988888888');
+
 INSERT INTO Books (Title, AuthorID, Genre, PublicationYear) VALUES 
 ('1984', 1, 'Dystopian', 1949),
-('To Kill a Mockingbird', 2, 'Fiction', 1960),
-('Animal Farm', 1, 'Allegory', 1945),
-('The Lord of the Rings', 3, 'Fantasy', 1954);
+('Harry Potter e a Pedra Filosofal', 2, 'Fantasy', 1997),
+('Foundation', 3, 'Sci-Fi', 1951);
 
--- Inserindo membros
-INSERT INTO Members (Name, Email, Phone) VALUES 
-('John Doe', 'john@example.com', '1234567890'),
-('Jane Smith', 'jane@example.com', '0987654321');
-
--- Registrando um empréstimo (Livro '1984' para 'John Doe')
--- O trigger trg_AfterLoanInsert marcará '1984' como IsAvailable = FALSE
-INSERT INTO Loans (BookID, MemberID, DueDate) VALUES 
-(1, 1, DATE_ADD(CURRENT_DATE, INTERVAL 14 DAY));
-
--- Registrando outro empréstimo (Livro 'To Kill a Mockingbird' para 'Jane Smith')
-INSERT INTO Loans (BookID, MemberID, DueDate) VALUES 
-(2, 2, DATE_ADD(CURRENT_DATE, INTERVAL 10 DAY));
-
--- Tentativa de emprestar um livro já emprestado (DEVE FALHAR)
--- Descomente a linha abaixo para testar o trigger trg_BeforeLoanInsert
--- INSERT INTO Loans (BookID, MemberID, DueDate) VALUES (1, 2, DATE_ADD(CURRENT_DATE, INTERVAL 5 DAY));
-
--- Atualizando a devolução de um livro (John Doe devolve '1984')
--- O trigger trg_AfterLoanUpdate marcará '1984' como IsAvailable = TRUE
-UPDATE Loans SET ReturnDate = CURRENT_DATE WHERE LoanID = 1;
-
--- =================================================================
--- 7. EXEMPLOS DE CONSULTAS
--- =================================================================
-
--- Consultando livros com autores (usando a View)
-SELECT * FROM BooksWithAuthors;
-
--- Consultando empréstimos ativos (usando a View)
--- (Deve mostrar apenas o empréstimo de 'Jane Smith', já que 'John Doe' devolveu o dele)
-SELECT * FROM ActiveLoans;
-
--- Consultando todos os livros e sua disponibilidade
-SELECT Title, IsAvailable FROM Books;
-
--- Usando a função para calcular dias de atraso (para todos os empréstimos)
-SELECT 
-    LoanID,
-    (SELECT Title FROM Books b WHERE b.BookID = l.BookID) AS BookTitle,
-    DueDate,
-    ReturnDate,
-    CalculateLateDays(LoanID) AS DaysLate
-FROM Loans l;
+-- Testando a Procedure de Empréstimo
+CALL sp_RegisterLoan(1, 1, 14); -- Ricardo pega 1984
+CALL sp_RegisterLoan(2, 2, 7);  -- Aluno pega Harry Potter
 
 -- =================================================================
 -- FIM DO SCRIPT
